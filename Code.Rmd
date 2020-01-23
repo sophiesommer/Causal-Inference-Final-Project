@@ -1,0 +1,897 @@
+---
+title: "Causal Final Project - Propensity Score Matching"
+output:
+  pdf_document: default
+  html_document: default
+\usepackage{float}
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+```
+   
+```{r, echo=FALSE, message=FALSE}
+require(dplyr)
+require(MASS)
+require(DescTools)
+require(optmatch) 
+require(Matching)
+require(arm)
+require(knitr)
+require(Hmisc)
+```
+  
+   
+Note: data is from: https://www.kaggle.com/janiobachmann/math-students/data   
+
+For this project, I am imagining that students are recruited for a math tutoring program, which provides supplemental support throughout a single school year. Demographic information is available for each student, including a pre-test score, and I am interested in measuring the effect of this program on students' final grades in their math course.  
+
+In order to make this data look more realistic, I have pulled a dataset from Kaggle, which includes information on a group of high school math students. Because there are so many variables, I first used a stepAIC algorithm to get a sense of which variables were significant predictors (in real life) of students' final test scores. Ten variables were selected by this algorithm, and I chose to keep these plus two others (sex and health status) as my variable pool for this simulation.   
+```{r, cache=TRUE}
+data <- read.csv("./Data/student-mat.csv")
+data <- data %>% dplyr::filter(school=="GP")
+data <- data %>% dplyr::select(sex, age, address, Pstatus, Medu, 
+                               Fedu, traveltime, studytime, romantic,
+                               failures, schoolsup, famsup, schoolsup, 
+                               activities, nursery, higher,internet, 
+                               famrel, freetime, goout, Dalc, Walc, health, 
+                               absences, G1, G3)
+null_model <- lm(G3 ~ 1, data = data)
+full_model <- lm(G3 ~ ., data = data)
+AIC_model <- stepAIC(null_model, 
+                     scope = list(upper = full_model, lower = null_model), 
+                     direction = "forward", trace = FALSE)
+summary(AIC_model)
+data <- data %>% dplyr::select(G3, G1, sex, age, romantic, absences, failures, 
+                               schoolsup, Walc, traveltime, famrel, goout, health)
+
+# this is to help me build the logit model for my hypothetical "treatment"
+get_sch_supp <- glm(schoolsup ~ . , data = data[,-1], family = binomial(link = "logit"))
+summary(get_sch_supp) 
+
+data <- data[,-which(names(data)=="schoolsup")]
+```   
+    
+Data Dictionary:    
+sex - student's sex (binary: 'F' - female or 'M' - male)  
+age - student's age (numeric: from 15 to 22)  
+traveltime - home to school travel time (numeric: 1 - <15 min., 2 - 15 to 30 min., 3 - 30 min. to 1 hour, or 4 - >1 hour)  
+failures - number of past class failures (numeric: n if 1<=n<3, else 4)  
+schoolsup - extra educational support (binary: yes or no)  
+romantic - in a romantic relationship (binary: yes or no)
+famrel - quality of family relationships (numeric: from 1 - very bad to 5 - excellent)  
+goout - going out with friends (numeric: from 1 - very low to 5 - very high)  
+Walc - weekend alcohol consumption (numeric: from 1 - very low to 5 - very high)  
+absences - number of school absences (numeric: from 0 to 93)  
+health - current health status (numeric: from 1 - very bad to 5 - very good)  
+G1 - first period grade in Math class (scored from 0-20)  
+  
+Now, I am going to generate data under the following two models:    
+
+## Data generation 1 (World A)
+World A: linear relationship where all variables predict both treatment assignment and potential outcomes.  
+```{r, cache=TRUE} 
+set.seed(123)
+
+dataGen_A <- function(data){
+  treat = 9 - 0.41 * data$G1 - 0.4 * data$age - 
+    0.25 * (data$romantic=="yes") - 0.03 * data$absences + 
+    0.3 * data$failures - 0.1 * data$Walc - 0.1 * data$traveltime + 
+    0.2 * data$famrel - 0.05 * data$goout + 0.4 * data$health - 
+    0.5 * (data$sex == "M") +
+    rnorm(nrow(data), 0, 1)
+
+  prob = LogitInv(treat)
+  treat = rbinom(nrow(data), 1, prob=prob)
+
+  Y0 = 2.9 + 0.9 * data$G1 + 0.2 * data$age - 
+    0.5 * (data$romantic=="yes") + 
+    0.15 * data$absences - 0.9 * data$failures - 
+    0.8 * data$Walc - 1 * data$traveltime + 
+    0.5 * data$famrel - 0.5 * data$goout + 
+    0.2 * data$health - 0.5 * (data$sex == "M") +
+    rnorm(nrow(data), 0, 1)
+
+  Y1 = 2.9 + 0.9 * data$G1 + 0.2 * data$age - 
+    0.5 * (data$romantic=="yes") + 
+    0.15 * data$absences - 0.9 * data$failures - 
+    0.8 * data$Walc - 1 * data$traveltime + 
+    0.5 * data$famrel - 0.5 * data$goout + 
+    0.2 * data$health - 0.5 * (data$sex == "M") + 
+    3 + rnorm(nrow(data), 0, 1)
+
+  Y = ifelse(treat == 1, Y1, Y0)
+  dataA = data.frame(Y=Y,treat=treat)
+  covars = data[,-1]
+  dataA = cbind(dataA, covars)
+  return(list(dataA, data.frame(Y0=Y0,Y1=Y1)))
+}
+
+#generate some data
+dat <- dataGen_A(data)
+dataA <- dat[[1]]
+outcomes <- dat[[2]]
+
+#calculate SATT
+SATT_A <- mean(outcomes$Y1[dataA$treat==1]) - mean(outcomes$Y0[dataA$treat==1])
+SATT_A
+```
+  
+## Data generation 2 (World B) 
+World B: Make the response surface more complex by adding interation and quadratic terms and making treatment effect moderated by pre-test score.    
+```{r, cache=TRUE}  
+set.seed(111)
+
+
+dataGen_B <- function(data){
+  treat = 4 - 0.3 * data$G1 + .021 * data$G1^2 - 0.3 * data$age - 
+    0.1 * data$age * (data$sex=="M") - 0.25 * (data$romantic=="yes") - 
+    0.03 * data$absences + 0.3 * data$failures - 0.1 * data$failures^2 - 
+    0.1 * data$Walc - 0.12 * data$traveltime + 0.2 * data$famrel - 
+    0.05 * data$goout + 0.1 * data$health + 0.05 * data$health^2 - 
+    0.3 * (data$sex == "M") -.12 * data$famrel * data$traveltime + 
+    .08 * data$famrel * data$health + rnorm(nrow(data), 0, 1)
+
+  prob = LogitInv(treat)
+  treat = rbinom(nrow(data), 1, prob=prob)
+
+  Y0 = 14 + 1.3 * data$G1 - .07 * data$G1^2 + 0.1 * data$age - 
+    0.5 * data$age * (data$sex=="M") - 0.5 * (data$romantic=="yes") + 
+    0.1 * data$absences - 0.5 * data$failures - 0.3 * data$Walc - 
+    1 * data$traveltime + 0.5 * data$famrel - 0.2 * data$goout + 
+    0.2 * data$health - 0.5 * (data$sex == "M") - 0.1 * data$failures^2 - 
+    .2 * data$famrel * data$traveltime - .1 * data$famrel * data$health + 
+    + 0.05 * data$health^2 + rnorm(nrow(data), 0, 1)
+
+  Y1 = 14 + 1.3 * data$G1 - .07 * data$G1^2 + 0.1 * data$age - 
+    0.5 * data$age * (data$sex=="M") - 0.5 * (data$romantic=="yes") + 
+    0.1 * data$absences - 0.5 * data$failures - 0.3 * data$Walc - 
+    1 * data$traveltime + 0.5 * data$famrel - 0.2 * data$goout + 
+    0.2 * data$health - 0.5 * (data$sex == "M") - 0.1 * data$failures^2 - 
+    .2 * data$famrel * data$traveltime - .1 * data$famrel * data$health + 
+    0.05 * data$health^2 + rnorm(nrow(data), 0, 1) + 4 - .1 * data$G1
+
+  Y = ifelse(treat == 1, Y1, Y0)
+  dataB = data.frame(Y=Y,treat=treat)
+  covars = data[,-1]
+  dataB = cbind(dataB, covars)
+  
+  return(list(dataB, data.frame(Y0=Y0,Y1=Y1)))
+}
+
+#generate some data
+dat <- dataGen_B(data)
+dataB <- dat[[1]]
+outcomes <- dat[[2]]
+
+#look at overlap of propensity scores for this data
+pscore_fit3 <- glm(treat ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime , 
+                   data = dataB[,-c(1)], family = "binomial")
+pscore3 <- predict(pscore_fit3, dataB[-1], type = "response")
+hist(pscore3[dataB$treat==0], col = rgb(0.9,0.8,0.0,0.5), xlim=c(0,1))
+hist(pscore3[dataB$treat==1], add=TRUE, col = rgb(0.0,0.5,0.9,0.5))
+
+#calculate SATT
+SATT_B <- mean(outcomes$Y1[dataB$treat==1]) - mean(outcomes$Y0[dataB$treat==1])
+SATT_B
+```
+     
+Functions:  
+```{r, cache=TRUE}
+get_IPTW_weights <- function(treat, pscores){
+  weights <- rep(0, length(treat))
+  weights[treat==1] <- 1
+  weights[treat==0] <- pscores[treat==0]/(1-pscores[treat==0])
+  nc = sum(treat==0)
+  swc = sum(weights[treat==0])
+  weights[treat==0] <- (weights[treat==0]/swc)*nc
+  return(weights)
+}
+
+get_optm_weights <- function(treat, matches){
+  chosen_controls <- matches[treat==0] %>% na.omit() %>% names() %>% as.numeric()
+  weights <- rep(0, length(treat))
+  weights[chosen_controls] <- 1
+  weights[treat==1] <- 1
+  return(weights)
+}
+
+get_gen_weights <- function(treat, matches){
+  weights <- rep(0, length(treat))
+  matched_controls <- unique(matches[,2])
+  control_weights <- rep(0, length(matched_controls))
+  for(i in 1:length(matched_controls)){
+    weight_list <- matches[,3][matches[,2]==matched_controls[i]]
+    control_weights[i] <- sum(weight_list)
+  }
+  weights[matched_controls] <- control_weights
+  weights[treat==1] <- 1
+  return(weights)
+}
+
+balance_func = function(df, covariates, weights){
+  ncov = length(covariates)
+  mn1 = mn0 = mn1.m = mn0.m = diff = diff.m = ratio = ratio.m = rep(0, ncov)
+  res = data.frame(mn1, mn0, mn1.m, mn0.m, diff, diff.m, ratio, ratio.m)
+  rownames(res) = covariates
+  w0 <- weights[which(df$treat==0)]
+  w1 <- weights[which(df$treat==1)]
+  for(i in 1:ncov){
+    res[i,"mn1"] = mean(df[,(covariates[i])][df$treat==1], na.rm=T)
+    res[i,"mn0"] = mean(df[,(covariates[i])][df$treat==0], na.rm=T)
+    res[i,"mn1.m"] = sum(df[,(covariates[i])][df$treat==1]*w1)/sum(w1)
+    res[i,"mn0.m"] = sum(df[,(covariates[i])][df$treat==0]*w0)/sum(w0)
+    if(length(unique(df[,(covariates[i])])) > 2){
+      res[i,"diff"] = (res[i,"mn1"] - 
+                         res[i,"mn0"])/sd(df[,(covariates[i])][df$treat==1])
+      res[i,"diff.m"] = (res[i,"mn1.m"] - 
+                           res[i,"mn0.m"])/sd(df[,(covariates[i])][df$treat==1])
+      res[i,"ratio"] = sd(df[,(covariates[i])][df$treat==0])/
+        sd(df[,(covariates[i])][df$treat==1])
+      res[i,"ratio.m"] = sqrt(Hmisc::wtd.var(df[,(covariates[i])][df$treat==0], w0))/
+        sqrt(Hmisc::wtd.var(df[,(covariates[i])][df$treat==1], w1))
+    } else {
+      res[i,"diff"] = res[i,"mn1"] - res[i,"mn0"]
+      res[i,"diff.m"] = res[i,"mn1.m"] - res[i,"mn0.m"]
+      res[i,"ratio"] = 0
+      res[i,"ratio.m"] = 0 
+      }
+  }
+  return(round(res,3))
+}
+```
+
+
+#  Model fitting for World A: The correct model  
+
+Calculate p-scores  
+```{r, cache=TRUE}
+pscore_fit1 <- glm(treat ~ . , data = dataA[,-c(1)], family = "binomial")
+pscore1 <- predict(pscore_fit1, dataA[-1], type = "response")  
+```
+   
+IPTW weights   
+```{r, cache=TRUE}
+weightsm1 <- get_IPTW_weights(dataA$treat, pscore1)
+est_1 <- lm(Y ~ . , weights=weightsm1, data = dataA)
+est_1 <- summary(est_1)$coef["treat",1]
+est_1
+
+XcovA <- dataA
+XcovA$sex <- as.numeric(XcovA$sex=="M")
+XcovA$romantic <- as.numeric(XcovA$romantic=="yes")
+
+covsA <- c("G1", "sex", "age", "romantic", "absences", "failures", "Walc", "traveltime", "famrel", "goout", "health")
+
+balance_func(XcovA, covsA, weightsm1)
+```
+    
+  
+
+Optimal matching  
+```{r, cache=TRUE}
+m2 <- pairmatch(pscore_fit1)
+weightsm2 <- get_optm_weights(dataA$treat, m2)
+est_2 <- lm(Y ~ . , weights=weightsm2, data = dataA)
+est_2 <- summary(est_2)$coef["treat",1]
+est_2
+
+balance_func(XcovA, covsA, weightsm2)
+```
+  
+Genetic matching  
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+#save just the x covariates
+Xcov <- dataA[,-c(1:2)]
+
+#add the propensity scores  
+Xcov$pscore <- pscore1
+
+#change factor variables to 1s and 0s
+Xcov$romantic <- as.numeric(Xcov$romantic=="yes")
+Xcov$sex <- as.numeric(Xcov$sex=="M")
+
+#run genetic matching
+m3 <- GenMatch(dataA$treat, Xcov, BalanceMatrix=Xcov, 
+               estimand="ATT", pop.size = 100, print=FALSE)
+
+#create weights based on genetic matching
+weightsm3 <- get_gen_weights(dataA$treat, m3$matches)
+
+#estimate treatment effect using the weights
+est_3 <- lm(Y ~ . , weights=weightsm3, data = dataA)
+est_3 <- summary(est_3)$coef["treat",1]
+est_3
+
+# Not sure why this is giving me a different answer:
+mgen <- Match(Y = dataA$Y, Tr = dataA$treat, X = Xcov, Weight.matrix = m3)
+mgen$est
+
+# Actually: this is the same as a regression without the other covariates
+summary(lm(Y ~ treat , weights=weightsm3, data = dataA))$coef["treat",1]
+
+balance_func(XcovA, covsA, weightsm3)
+```
+  
+#  Model fitting for World A: Missing some covariates   
+
+Calculate p-scores  
+```{r, cache=TRUE}
+pscore_fit2 <- glm(treat ~ G1 + sex + age + failures + absences, 
+                   data = dataA, family = "binomial")
+pscore2 <- predict(pscore_fit2, dataA, type = "response")
+```
+   
+IPTW weights   
+```{r, cache=TRUE}
+weightsm4 <- get_IPTW_weights(dataA$treat, pscore2)
+est_4 <- lm(Y ~ treat + G1 + sex + age + failures + absences, weights=weightsm4, data = dataA)
+est_4 <- summary(est_4)$coef["treat",1]
+est_4
+```
+    
+Optimal matching  
+```{r, cache=TRUE}
+m5 <- pairmatch(pscore_fit2)
+weightsm5 <- get_optm_weights(dataA$treat, m5)
+est_5 <- lm(Y ~ treat + G1 + sex + age + failures + absences, weights=weightsm5, data = dataA)
+est_5 <- summary(est_5)$coef["treat",1]
+est_5
+```
+  
+Genetic matching  
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+#save shorter covariate list
+Xcov <- Xcov %>% dplyr::select(G1, sex, age, failures, absences)
+Xcov$pscore <- pscore2
+
+#run genetic matching
+m6 <- GenMatch(dataA$treat, Xcov, BalanceMatrix=Xcov, 
+               estimand="ATT", pop.size = 100, print=FALSE)
+
+#create weights based on genetic matching
+weightsm6 <- get_gen_weights(dataA$treat, m6$matches)
+
+#estimate treatment effect using the weights
+est_6 <- lm(Y ~ treat + G1 + sex + age + failures + absences, 
+            weights=weightsm6, data = dataA)
+est_6 <- summary(est_6)$coef["treat",1]
+est_6
+```  
+    
+Verify that the treatment group is never larger than controls  
+```{r}
+ntreat <- rep(NA, 1000)
+for(i in 1:1000){
+  dataA <- dataGen_A(data)[[1]]
+  ntreat[i] <- sum(dataA$treat==1)
+}
+sum((ntreat/nrow(dataA))>.5)
+mean(ntreat/nrow(dataA))
+```  
+  
+Randomization distributions (note: this takes a very long time to run):  
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+nSim  <- 1000
+simA_IPTW <- simA_IPTW_WrongMod <- rep(NA, nSim)
+simA_optm <- simA_optm_WrongMod <- rep(NA, nSim)
+simA_Gen <- simA_Gen_WrongMod <- rep(NA, nSim)
+
+mat <- matrix(NA, ncol=length(covsA), nrow=nSim)
+colnames(mat) <- covsA
+simA_IPTW_bal <- simA_IPTW_WrongMod_bal <- mat
+simA_optm_bal <- simA_optm_WrongMod_bal <- mat
+simA_Gen_bal <- simA_Gen_WrongMod_bal <- mat
+
+for(i in 1:1000){
+  dataA <- dataGen_A(data)[[1]]
+  
+  #pscores
+  pscore_fit1 <- glm(treat ~ . , data = dataA[,-c(1)], family = "binomial")
+  pscore1 <- predict(pscore_fit1, dataA[-1], type = "response")
+  pscore_fit2 <- glm(treat ~ G1 + sex + age + failures + absences, 
+                   data = dataA, family = "binomial")
+  pscore2 <- predict(pscore_fit2, dataA, type = "response")
+  
+  #iptw
+  weightsm1 <- get_IPTW_weights(dataA$treat, pscore1)
+  est_1 <- lm(Y ~ . , weights=weightsm1, data = dataA)
+  simA_IPTW[i] <- summary(est_1)$coef["treat",1]
+  simA_IPTW_bal[i,] <- balance_func(XcovA, covsA, weightsm1)$diff.m
+  
+  #optimal
+  m2 <- pairmatch(pscore_fit1)
+  weightsm2 <- get_optm_weights(dataA$treat, m2)
+  est_2 <- lm(Y ~ . , weights=weightsm2, data = dataA)
+  simA_optm[i] <- summary(est_2)$coef["treat",1]
+  simA_optm_bal[i,] <- balance_func(XcovA, covsA, weightsm2)$diff.m
+  
+  #save just the x covariates
+  Xcov <- XcovA[,-c(1:2)]
+  #add the propensity scores  
+  #Xcov$pscore <- pscore1
+
+  #genetic
+  m3 <- GenMatch(dataA$treat, Xcov, BalanceMatrix=Xcov, 
+               estimand="ATT", pop.size = 100, print=FALSE)
+  weightsm3 <- get_gen_weights(dataA$treat, m3$matches)
+  est_3 <- lm(Y ~ . , weights=weightsm3, data = dataA)
+  simA_Gen[i] <- summary(est_3)$coef["treat",1]
+  simA_Gen_bal[i,] <- balance_func(XcovA, covsA, weightsm3)$diff.m
+  
+  #iptw
+  weightsm4 <- get_IPTW_weights(dataA$treat, pscore2)
+  est_4 <- lm(Y ~ treat + G1 + sex + age + failures + absences, 
+              weights=weightsm4, data = dataA)
+  simA_IPTW_WrongMod[i] <- summary(est_4)$coef["treat",1]
+  simA_IPTW_WrongMod_bal[i,] <- balance_func(XcovA, covsA, weightsm4)$diff.m
+  
+  #optimal
+  m5 <- pairmatch(pscore_fit2)
+  weightsm5 <- get_optm_weights(dataA$treat, m5)
+  est_5 <- lm(Y ~ treat + G1 + sex + age + failures + absences, 
+              weights=weightsm5, data = dataA)
+  simA_optm_WrongMod[i] <- summary(est_5)$coef["treat",1]
+  simA_optm_WrongMod_bal[i,] <- balance_func(XcovA, covsA, weightsm5)$diff.m
+  
+  #save less covars
+  Xcov <- Xcov %>% dplyr::select(G1, sex, age, failures, absences)
+  #Xcov$pscore <- pscore2
+
+  #run genetic matching
+  m6 <- GenMatch(dataA$treat, Xcov, BalanceMatrix=Xcov, 
+               estimand="ATT", pop.size = 100, print=FALSE)
+  weightsm6 <- get_gen_weights(dataA$treat, m6$matches)
+
+  #estimate treatment effect using the weights
+  est_6 <- lm(Y ~ treat + G1 + sex + age + failures + absences, 
+            weights=weightsm6, data = dataA)
+  simA_Gen_WrongMod[i] <- summary(est_6)$coef["treat",1]
+  simA_Gen_WrongMod_bal[i,] <- balance_func(XcovA, covsA, weightsm6)$diff.m
+  
+  print(i)
+  
+}
+```    
+   
+Save everything, just in case!
+```{r}
+# statsA_final <-cbind(simA_IPTW,  simA_optm,  simA_Gen, simA_IPTW_WrongMod,
+# simA_optm_WrongMod,simA_Gen_WrongMod)
+# 
+# colnames(statsA_final) <- c("simA_IPTW","simA_optm","simA_Gen","simA_IPTW_WrongMod",
+# "simA_optm_WrongMod","simA_Gen_WrongMod")
+# 
+# write.csv(statsA_final, "./statsA_final.csv")
+# write.csv(simA_IPTW_bal, "./IPTW_bal.csv")
+# write.csv(simA_optm_bal, "./optm_bal.csv")
+# write.csv(simA_Gen_bal, "./Gen_bal.csv")
+# write.csv(simA_IPTW_WrongMod_bal, "./IPTW_WM_bal.csv")
+# write.csv(simA_optm_WrongMod_bal, "./optm_WM_bal.csv")
+# write.csv(simA_Gen_WrongMod_bal, "./Gen_WM_bal.csv")
+```
+    
+      
+Summary table:  
+```{r, cache=TRUE}
+Biases <- round(abs(c(mean(simA_IPTW),
+                     mean(simA_optm),
+                     mean(simA_Gen),
+                     mean(simA_IPTW_WrongMod),
+                     mean(simA_optm_WrongMod),
+                     mean(simA_Gen_WrongMod))-3),2)
+RMSEs <- round(c(sqrt(mean((simA_IPTW-3)^2)),
+                 sqrt(mean((simA_optm-3)^2)),
+                 sqrt(mean((simA_Gen-3)^2)),
+                 sqrt(mean((simA_IPTW_WrongMod-3)^2)),
+                 sqrt(mean((simA_optm_WrongMod-3)^2)),
+                 sqrt(mean((simA_Gen_WrongMod-3)^2))),2)
+Included_Diff <- round(c(mean(abs(simA_IPTW_bal[,c(1:11)])),
+                     mean(abs(simA_optm_bal[,c(1:11)])),
+                     mean(abs(simA_Gen_bal[,c(1:11)])),
+                     mean(abs(simA_IPTW_WrongMod_bal[,c(1:3,5:6)])),
+                     mean(abs(simA_optm_WrongMod_bal[,c(1:3,5:6)])),
+                     mean(abs(simA_Gen_WrongMod_bal[,c(1:3,5:6)]))),2)
+Excluded_Diff <- round(c(mean(abs(simA_IPTW_bal[,c(1:11)])),
+                     mean(abs(simA_optm_bal[,c(1:11)])),
+                     mean(abs(simA_Gen_bal[,c(1:11)])),
+                     mean(abs(simA_IPTW_WrongMod_bal[,c(4,7:11)])),
+                     mean(abs(simA_optm_WrongMod_bal[,c(4,7:11)])),
+                     mean(abs(simA_Gen_WrongMod_bal[,c(4,7:11)]))),2)
+
+results <- data.frame(Bias = Biases,
+                      RMSE = RMSEs,
+                      Mean_Sd_Diff_Included = Included_Diff,
+                      Mean_Sd_Diff_NotIncluded = Excluded_Diff)
+rownames(results) <- c("IPTW - Correct Model", "Optimal - Correct Model", 
+                       "Genetic - Correct Model",
+                       "IPTW - Wrong Model", "Optimal - Wrong Model",
+                       "Genetic - Wrong Model")
+kable(results)
+```    
+  
+Sampling distributions:  
+```{r, cache=TRUE}
+par(mfrow = c(2,3))
+hist(simA_IPTW, xlim=c(2,4.5), main="IPTW Correct Model", xlab="ATT Estimate")
+abline(v=3, lwd=2, col=4)
+abline(v=mean(simA_IPTW), lwd=2, col=2, lty=2)
+hist(simA_optm, xlim=c(2,4.5), main="Opt Matching Correct Model", xlab="ATT Estimate")
+abline(v=3, lwd=2, col=4)
+abline(v=mean(simA_optm), lwd=2, col=2, lty=2)
+hist(simA_Gen, xlim=c(2,4.5), main="Gen Matching Correct Model", xlab="ATT Estimate")
+abline(v=3, lwd=2, col=4)
+abline(v=mean(simA_Gen), lwd=2, col=2, lty=2)
+hist(simA_IPTW_WrongMod, xlim=c(2,4.5), main="IPTW Wrong Model", xlab="ATT Estimate")
+abline(v=3, lwd=2, col=4)
+abline(v=mean(simA_IPTW_WrongMod), lwd=2, col=2, lty=2)
+hist(simA_optm_WrongMod, xlim=c(2,4.5), main="Opt Matching Wrong Model", xlab="ATT Estimate")
+abline(v=3, lwd=2, col=4)
+abline(v=mean(simA_optm_WrongMod), lwd=2, col=2, lty=2)
+hist(simA_Gen_WrongMod, xlim=c(2,4.5), main="Gen Matching Wrong Model", xlab="ATT Estimate")
+abline(v=3, lwd=2, col=4)
+abline(v=mean(simA_Gen_WrongMod), lwd=2, col=2, lty=2)
+```
+     
+
+#  Model fitting for World B: The correct model  
+
+Calculate p-scores  
+```{r, cache=TRUE}
+pscore_fit3 <- glm(treat ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime + famrel:health, 
+                   data = dataB[,-c(1)], family = "binomial")
+pscore3 <- predict(pscore_fit3, dataB[-1], type = "response")
+
+#saving x covariates
+XcovB <- dataB[,-c(1)]
+XcovB$romantic <- as.numeric(XcovB$romantic=="yes")
+XcovB$sex <- as.numeric(XcovB$sex=="M")
+XcovB$G1sq <- (XcovB$G1)^2
+XcovB$agesex <- XcovB$age * XcovB$sex
+XcovB$failuressq <- (XcovB$failures)^2
+XcovB$healthsq <- (XcovB$health)^2
+XcovB$famreltravtime <- XcovB$famrel * XcovB$traveltime
+XcovB$famrelhealth <- XcovB$famrel * XcovB$health
+
+#saving covariate names
+covsB <- c("G1", "sex", "age", "romantic", "absences", "failures", "Walc", "traveltime", "famrel", "goout", "health", "G1sq", "agesex", "failuressq", "healthsq", "famreltravtime","famrelhealth")
+```
+   
+IPTW weights   
+```{r, cache=TRUE}
+weightsm1_B <- get_IPTW_weights(dataB$treat, pscore3)
+est_1_B <- lm(Y ~ . + I(G1^2) + age:sex + famrel:traveltime + I(failures^2) 
+              + I(health^2) + famrel:health, weights=weightsm1_B, data = dataB)
+est_1_B <- summary(est_1_B)$coef["treat",1]
+est_1_B
+
+balance_func(XcovB, covsB, weightsm1_B)
+```
+    
+Optimal matching  
+```{r, cache=TRUE}
+m2_B <- pairmatch(treat ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime , 
+                   data = dataB[,-c(1)])
+weightsm2_B <- get_optm_weights(dataB$treat, m2_B)
+est_2_B <- lm(Y ~ . + I(G1^2) + age:sex + famrel:traveltime + 
+              famrel:health, weights=weightsm2_B, data = dataB)
+est_2_B <- summary(est_2_B)$coef["treat",1]
+est_2_B
+
+balance_func(XcovB, covsB, weightsm2_B)
+```
+  
+Genetic matching   
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+#save just the x covariates
+Xcov <- XcovB[,-c(1)]
+
+#add the propensity scores  
+Xcov$pscore <- pscore3
+
+#run genetic matching
+m3_B <- GenMatch(dataB$treat, Xcov, BalanceMatrix=Xcov, 
+               estimand="ATT", pop.size = 100, print=FALSE)
+
+#create weights based on genetic matching
+weightsm3_B <- get_gen_weights(dataB$treat, m3_B$matches)
+
+#estimate treatment effect using the weights
+est_3_B <- lm(Y ~ . + I(G1^2) + age:sex + famrel:traveltime + I(failures^2) 
+              + I(health^2) + famrel:health, weights=weightsm3_B, data = dataB)
+est_3_B <- summary(est_3_B)$coef["treat",1]
+est_3_B
+
+balance_func(XcovB, covsB, weightsm3_B)
+```
+   
+
+
+#  Model fitting for World B: Ignoring the complex response surface   
+
+Calculate p-scores   
+```{r, cache=TRUE}
+dat <- dataGen_B(data)
+dataB <- dat[[1]]
+outcomes <- dat[[2]]
+
+pscore_fit4 <- glm(treat ~ ., data = dataB[,-c(1)], family = "binomial")
+pscore4 <- predict(pscore_fit4, dataB, type = "response")
+
+XcovB_sub <- XcovB[,-c(13:18)]
+covsB_sub <- c("G1", "sex", "age", "romantic", "absences", "failures", "Walc", "traveltime", "famrel", "goout", "health")
+```
+   
+IPTW weights   
+```{r, cache=TRUE}
+weightsm4_B <- get_IPTW_weights(dataB$treat, pscore4)
+est_4_B <- lm(Y ~ ., weights=weightsm4_B, data = dataB)
+est_4_B <- summary(est_4_B)$coef["treat",1]
+est_4_B
+
+balance_func(XcovB_sub, covsB_sub, weightsm4_B)
+balance_func(XcovB, covsB, weightsm4_B)
+```
+    
+Optimal matching  
+```{r, cache=TRUE}
+m5_B <- pairmatch(pscore_fit4)
+weightsm5_B <- get_optm_weights(dataB$treat, m5_B)
+est_5_B <- lm(Y ~ ., weights=weightsm5_B, data = dataB)
+est_5_B <- summary(est_5_B)$coef["treat",1]
+est_5_B
+
+balance_func(XcovB_sub, covsB_sub, weightsm5_B)
+balance_func(XcovB, covsB, weightsm5_B)
+```
+  
+Genetic matching   
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+Xcov <- XcovB_sub[,-c(1)]
+
+#re-save p score
+Xcov$pscore <- pscore4
+
+#run genetic matching
+m6_B <- GenMatch(dataB$treat, Xcov, BalanceMatrix=Xcov, 
+                 estimand="ATT", pop.size = 100, print=FALSE)
+
+#create weights based on genetic matching
+weightsm6_B <- get_gen_weights(dataB$treat, m6_B$matches)
+
+#estimate treatment effect using the weights
+est_6_B <- lm(Y ~ ., weights=weightsm6_B, data = dataB)
+est_6_B <- summary(est_6_B)$coef["treat",1]
+est_6_B
+
+balance_func(XcovB_sub, covsB_sub, weightsm6_B)
+balance_func(XcovB, covsB, weightsm6_B)
+```    
+     
+Estimate PATT
+```{r, cache=TRUE}
+#calculate PATT
+SATTs <- rep(NA, 100000)
+for(i in 1:100000){
+  dat <- dataGen_B(data)
+  dataB <- dat[[1]]
+  outcomes <- dat[[2]]
+  SATTs[i] <- mean(outcomes$Y1[dataB$treat==1]) - mean(outcomes$Y0[dataB$treat==1])
+}
+PATT <- mean(SATTs)
+PATT
+```  
+    
+Verify that the treatment group is never larger than controls  
+```{r}
+ntreat <- rep(NA, 1000)
+for(i in 1:1000){
+  dataB <- dataGen_B(data)[[1]]
+  ntreat[i] <- sum(dataB$treat==1)
+}
+sum((ntreat/nrow(dataB))>.5)
+mean(ntreat/nrow(dataB))
+```
+
+Randomization distributions:    
+```{r, cache=TRUE, message=FALSE, warning=FALSE}
+nSim  <- 1000
+simB_IPTW <- simB_IPTW_WrongMod <- rep(NA, nSim)
+simB_optm <- simB_optm_WrongMod <- rep(NA, nSim)
+simB_Gen <- simB_Gen_WrongMod <- rep(NA, nSim)
+
+
+mat <- matrix(NA, ncol=length(covsB), nrow=nSim)
+colnames(mat) <- covsB
+simB_IPTW_bal <- simB_IPTW_WrongMod_bal <- mat
+simB_optm_bal <- simB_optm_WrongMod_bal <- mat
+simB_Gen_bal <- simB_Gen_WrongMod_bal <- mat
+
+for(i in 1:1000){
+  dataB <- dataGen_B(data)[[1]]
+  
+  pscore_fit3 <- glm(treat ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime + famrel:health, 
+                   data = dataB[,-c(1)], family = "binomial")
+  pscore3 <- predict(pscore_fit3, dataB[-1], type = "response")
+  pscore_fit4 <- glm(treat ~ ., data = dataB[,-c(1)], family = "binomial")
+  pscore4 <- predict(pscore_fit4, dataB[-1], type = "response")
+  
+  weightsm1_B <- get_IPTW_weights(dataB$treat, pscore3)
+  est_1_B <- lm(Y ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime + famrel:health, 
+                weights=weightsm1_B, data = dataB)
+  simB_IPTW[i] <- summary(est_1_B)$coef["treat",1]
+  simB_IPTW_bal[i,] <- balance_func(XcovB, covsB, weightsm1_B)$diff.m
+  
+  m2_B <- pairmatch(pscore_fit3)
+  weightsm2_B <- get_optm_weights(dataB$treat, m2_B)
+  est_2_B <- lm(Y ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime + famrel:health, 
+                weights=weightsm2_B, data = dataB)
+  simB_optm[i] <- summary(est_2_B)$coef["treat",1]
+  simB_optm_bal[i,] <- balance_func(XcovB, covsB, weightsm2_B)$diff.m
+  
+  #save x covariates
+  Xcov <- XcovB[,-c(1)]
+  #add the propensity scores  
+  #Xcov$pscore <- pscore3
+
+  #run genetic matching
+  m3_B <- GenMatch(dataB$treat, Xcov, BalanceMatrix=Xcov, 
+               estimand="ATT", pop.size = 100, print=FALSE)
+  weightsm3_B <- get_gen_weights(dataB$treat, m3_B$matches)
+  est_3_B <- lm(Y ~ . + I(G1^2) + age:sex + I(failures^2) 
+                + I(health^2) + famrel:traveltime + famrel:health, 
+                weights=weightsm3_B, data = dataB)
+  simB_Gen[i] <- summary(est_3_B)$coef["treat",1]
+  simB_Gen_bal[i,] <- balance_func(XcovB, covsB, weightsm3_B)$diff.m
+  
+  #iptw weights
+  weightsm4_B <- get_IPTW_weights(dataB$treat, pscore4)
+  est_4_B <- lm(Y ~ ., weights=weightsm4_B, data = dataB)
+  simB_IPTW_WrongMod[i] <- summary(est_4_B)$coef["treat",1]
+  simB_IPTW_WrongMod_bal[i,] <- balance_func(XcovB, covsB, weightsm4_B)$diff.m
+  
+  #optimal matching
+  m5_B <- pairmatch(pscore_fit4)
+  weightsm5_B <- get_optm_weights(dataB$treat, m5_B)
+  est_5_B <- lm(Y ~ ., weights=weightsm5_B, data = dataB)
+  simB_optm_WrongMod[i] <- summary(est_5_B)$coef["treat",1]
+  simB_optm_WrongMod_bal[i,] <- balance_func(XcovB, covsB, weightsm5_B)$diff.m
+  
+  #save selected covariates
+  Xcov <- XcovB_sub[,-c(1)]
+  #re-save p score
+  #Xcov$pscore <- pscore4
+
+  #run genetic matching
+  m6_B <- GenMatch(dataB$treat, Xcov, BalanceMatrix=Xcov, 
+                 estimand="ATT", pop.size = 100, print=FALSE)
+  weightsm6_B <- get_gen_weights(dataB$treat, m6_B$matches)
+  est_6_B <- lm(Y ~ ., weights=weightsm6_B, data = dataB)
+  simB_Gen_WrongMod[i] <- summary(est_6_B)$coef["treat",1]
+  simB_Gen_WrongMod_bal[i,] <- balance_func(XcovB, covsB, weightsm6_B)$diff.m
+  
+  print(i)
+}
+
+```    
+    
+Save everything, just in case!
+```{r}
+# statsB_final <-cbind(simB_IPTW,  simB_optm,  simB_Gen, simB_IPTW_WrongMod,
+# simB_optm_WrongMod,simB_Gen_WrongMod)
+# 
+# colnames(statsB_final) <- c("simB_IPTW","simB_optm","simB_Gen",                   "simB_IPTW_WrongMod","simB_optm_WrongMod","simB_Gen_WrongMod")
+# 
+# write.csv(statsB_final, "./statsB_final.csv")
+# write.csv(simB_IPTW_bal, "./IPTW_bal_B.csv")
+# write.csv(simB_optm_bal, "./optm_bal_B.csv")
+# write.csv(simB_Gen_bal, "./Gen_bal_B.csv")
+# write.csv(simB_IPTW_WrongMod_bal, "./IPTW_WM_bal_B.csv")
+# write.csv(simB_optm_WrongMod_bal, "./optm_WM_bal_B.csv")
+# write.csv(simB_Gen_WrongMod_bal, "./Gen_WM_bal_B.csv")
+```
+    
+Summary table  
+```{r, cache=TRUE}
+Biases <- round(abs(c(mean(simB_IPTW),
+                     mean(simB_optm),
+                     mean(simB_Gen),
+                     mean(simB_IPTW_WrongMod),
+                     mean(simB_optm_WrongMod),
+                     mean(simB_Gen_WrongMod))-PATT),2)
+RMSEs <- round(c(sqrt(mean((simB_IPTW-PATT)^2)),
+                 sqrt(mean((simB_optm-PATT)^2)),
+                 sqrt(mean((simB_Gen-PATT)^2)),
+                 sqrt(mean((simB_IPTW_WrongMod-PATT)^2)),
+                 sqrt(mean((simB_optm_WrongMod-PATT)^2)),
+                 sqrt(mean((simB_Gen_WrongMod-PATT)^2))),2)
+Included_Diff <- round(c(mean(abs(simB_IPTW_bal[,c(1:17)])),
+                     mean(abs(simB_optm_bal[,c(1:17)])),
+                     mean(abs(simB_Gen_bal[,c(1:17)])),
+                     mean(abs(simB_IPTW_WrongMod_bal[,c(1:11)])),
+                     mean(abs(simB_optm_WrongMod_bal[,c(1:11)])),
+                     mean(abs(simB_Gen_WrongMod_bal[,c(1:11)]))),2)
+Excluded_Diff <- round(c(mean(abs(simB_IPTW_bal[,c(1:17)])),
+                     mean(abs(simB_optm_bal[,c(1:17)])),
+                     mean(abs(simB_Gen_bal[,c(1:17)])),
+                     mean(abs(simB_IPTW_WrongMod_bal[,c(12:17)])),
+                     mean(abs(simB_optm_WrongMod_bal[,c(12:17)])),
+                     mean(abs(simB_Gen_WrongMod_bal[,c(12:17)]))),2)
+
+results <- data.frame(Bias = Biases,
+                      RMSE = RMSEs,
+                      Mean_Sd_Diff_Included = Included_Diff,
+                      Mean_Sd_Diff_NotIncluded = Excluded_Diff)
+rownames(results) <- c("IPTW - Correct Model", "Optimal - Correct Model", 
+                       "Genetic - Correct Model",
+                       "IPTW - Wrong Model", "Optimal - Wrong Model",
+                       "Genetic - Wrong Model")
+kable(results)
+```    
+    
+Sampling distributions  
+```{r, cache=TRUE}
+par(mfrow = c(2,3))
+hist(simB_IPTW, xlim=c(1.5,3.5), 
+     main="IPTW Correct Model", xlab="ATT Estimate")
+abline(v=PATT, lwd=2, col=4)
+abline(v=mean(simB_IPTW), lwd=2, col=2, lty=2)
+hist(simB_optm, xlim=c(1.5,3.5), 
+     main="Opt Matching Correct Model", xlab="ATT Estimate")
+abline(v=PATT, lwd=2, col=4)
+abline(v=mean(simB_optm), lwd=2, col=2, lty=2)
+hist(simB_Gen, xlim=c(1.5,3.5),
+     main="Genetic Matching Correct Model", xlab="ATT Estimate")
+abline(v=PATT, lwd=2, col=4)
+abline(v=mean(simB_Gen), lwd=2, col=2, lty=2)
+hist(simB_IPTW_WrongMod, xlim=c(1.5,3.5), 
+     main="IPTW Wrong Model", xlab="ATT Estimate")
+abline(v=PATT, lwd=2, col=4)
+abline(v=mean(simB_IPTW_WrongMod), lwd=2, col=2, lty=2)
+hist(simB_optm_WrongMod, xlim=c(1.5,3.5), 
+     main="Opt Matching Wrong Model", xlab="ATT Estimate")
+abline(v=PATT, lwd=2, col=4)
+abline(v=mean(simB_optm_WrongMod), lwd=2, col=2, lty=2)
+hist(simB_Gen_WrongMod, xlim=c(1.5,3.5),
+     main="Genetic Matching Wrong Model", xlab="ATT Estimate")
+abline(v=PATT, lwd=2, col=4)
+abline(v=mean(simB_Gen_WrongMod), lwd=2, col=2, lty=2)
+```  
+   
+Comparing to matching with replacement:  
+```{r}
+simB_wreplace
+for(i in 1:nSim){
+  dataB <- dataGen_B(data)[[1]]
+  
+  pscore_fit3 <- glm(treat ~ . + I(G1^2) + age:sex + I(failures^2) 
+                   + I(health^2) + famrel:traveltime , 
+                   data = dataB[,-c(1)], family = "binomial")
+  pscore3 <- predict(pscore_fit3, dataB[-1], type = "response")
+  
+  match1 <- arm::matching(dataB$treat, score=pscore3, replace = TRUE)
+  weightsm2_B <- rep(0, nrow(dataB))
+  # weightsm2_B[which(dataB$treat==0) %in% match1$matched] <- 1
+  weightsm2_B[dataB$treat==0] <- match1$cnts
+  weightsm2_B[dataB$treat==1] <- 1
+  
+  est_2_B <- lm(Y ~ . + I(G1^2) + age:sex + famrel:traveltime + 
+              famrel:health, weights=weightsm2_B, data = dataB)
+  simB_wreplace[i] <- summary(est_2_B)$coef["treat",1]
+
+}
+
+
+mean(simB_wreplace)
+```
+
+  
+Citation:  
+P. Cortez and A. Silva. Using Data Mining to Predict Secondary School Student Performance. In A. Brito and J. Teixeira Eds., Proceedings of 5th FUture BUsiness TEChnology Conference (FUBUTEC 2008) pp. 5-12, Porto, Portugal, April, 2008, EUROSIS, ISBN 978-9077381-39-7. [Web Link]  
+
+  
