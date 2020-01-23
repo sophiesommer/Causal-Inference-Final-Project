@@ -1,1 +1,2 @@
-# Causal-Inference-Final-Project
+# Causal-Inference-Final-Project  
+This repository includes code and writing from my final project for a Causal Inference course, taken with Professor Jennifer Hill as part of the Applied Statistics for Social Science Research MS program at NYU. The project investigates and compares a few different propensity score matching methods, using simulations in R. 
